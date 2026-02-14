@@ -1,0 +1,1125 @@
+import pygame
+import numpy as np
+import sys
+import json  # CAMBIO: pickle → json
+import os
+import time
+from scipy.ndimage import zoom
+import math
+
+# Inicializar Pygame
+pygame.init()
+
+# Configuración VERTICAL - BLOQUES DE 600px
+ANCHO, ALTO = 1100, 2000
+COLOR_FONDO = (20, 20, 30)
+COLOR_PIZARRON = (15, 15, 25)
+COLOR_LAPIZ = (0, 180, 120)
+COLOR_TEXTO = (240, 240, 255)
+COLOR_BOTON = (70, 110, 190)
+COLOR_BOTON_ACTIVO = (100, 150, 230)
+COLOR_EXPLICACION = (180, 160, 220)
+
+pantalla = pygame.display.set_mode((ANCHO, ALTO))
+pygame.display.set_caption("IA VISUAL - Red Neuronal en Tiempo Real")
+reloj = pygame.time.Clock()
+fuente = pygame.font.SysFont(None, 24)
+fuente_grande = pygame.font.SysFont(None, 36)
+fuente_pequena = pygame.font.SysFont(None, 20)
+
+# ====================
+# CONFIGURACIÓN SEGURA
+# ====================
+CARPETA_SEGURA = os.path.join(os.path.expanduser("~"), ".ia_visual_segura")
+os.makedirs(CARPETA_SEGURA, mode=0o700, exist_ok=True)
+ARCHIVO_DATOS = os.path.join(CARPETA_SEGURA, "datos.json")
+CARACTERES_PERMITIDOS = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+
+def sanitizar_letra(letra):
+    """Valida que la letra sea segura"""
+    if not isinstance(letra, str) or len(letra) != 1:
+        return None
+    letra = letra.upper()
+    return letra if letra in CARACTERES_PERMITIDOS else None
+
+# ====================
+# PIZARRÓN DE DIBUJO (TU CÓDIGO ORIGINAL)
+# ====================
+class Pizarron:
+    def __init__(self, x, y, ancho, alto, celdas=16):
+        self.rect = pygame.Rect(x, y, ancho, alto)
+        self.celdas = celdas
+        self.celda_ancho = ancho // celdas
+        self.celda_alto = alto // celdas
+        self.dibujo = np.zeros((celdas, celdas))
+        self.ultima_pos = None
+    
+    def dibujar(self, pantalla):
+        # Fondo
+        pygame.draw.rect(pantalla, COLOR_PIZARRON, self.rect)
+        pygame.draw.rect(pantalla, (100, 100, 140), self.rect, 3)
+        
+        # Cuadrícula sutil
+        for i in range(self.celdas + 1):
+            pygame.draw.line(pantalla, (30, 30, 50),
+                           (self.rect.x + i * self.celda_ancho, self.rect.y),
+                           (self.rect.x + i * self.celda_ancho, self.rect.y + self.rect.height), 1)
+            pygame.draw.line(pantalla, (30, 30, 50),
+                           (self.rect.x, self.rect.y + i * self.celda_alto),
+                           (self.rect.x + self.rect.width, self.rect.y + i * self.celda_alto), 1)
+        
+        # Trazo
+        for fila in range(self.celdas):
+            for col in range(self.celdas):
+                if self.dibujo[fila][col] > 0:
+                    x = self.rect.x + col * self.celda_ancho + self.celda_ancho // 2
+                    y = self.rect.y + fila * self.celda_alto + self.celda_alto // 2
+                    valor = self.dibujo[fila][col]
+                    radio = int(self.celda_ancho // 2.5 * valor)
+                    color = (0, 220 + int(35 * (1 - valor)), 120)
+                    pygame.draw.circle(pantalla, color, (x, y), max(2, radio))
+    
+    def agregar_punto(self, x, y):
+        if self.rect.collidepoint(x, y):
+            col = (x - self.rect.x) // self.celda_ancho
+            fila = (y - self.rect.y) // self.celda_alto
+            
+            if 0 <= col < self.celdas and 0 <= fila < self.celdas:
+                self.dibujo[fila][col] = 1.0
+                
+                # Suavizado
+                for df in [-1, 0, 1]:
+                    for dc in [-1, 0, 1]:
+                        nf, nc = fila + df, col + dc
+                        if 0 <= nf < self.celdas and 0 <= nc < self.celdas:
+                            if df == 0 and dc == 0:
+                                self.dibujo[nf][nc] = 1.0
+                            else:
+                                self.dibujo[nf][nc] = max(self.dibujo[nf][nc], 0.3)
+                
+                # Conectar con punto anterior
+                if self.ultima_pos:
+                    l_col, l_fila = self.ultima_pos
+                    self._dibujar_linea(l_col, l_fila, col, fila)
+                
+                self.ultima_pos = (col, fila)
+                return True
+        return False
+    
+    def _dibujar_linea(self, x1, y1, x2, y2):
+        """Dibuja línea entre dos puntos"""
+        dx = abs(x2 - x1)
+        dy = abs(y2 - y1)
+        sx = 1 if x1 < x2 else -1
+        sy = 1 if y1 < y2 else -1
+        err = dx - dy
+        
+        x, y = x1, y1
+        while True:
+            if 0 <= x < self.celdas and 0 <= y < self.celdas:
+                self.dibujo[y][x] = 1.0
+                
+                # Suavizar bordes
+                for dx2 in [-1, 0, 1]:
+                    for dy2 in [-1, 0, 1]:
+                        nx, ny = x + dx2, y + dy2
+                        if 0 <= nx < self.celdas and 0 <= ny < self.celdas:
+                            if dx2 == 0 and dy2 == 0:
+                                self.dibujo[ny][nx] = 1.0
+                            else:
+                                self.dibujo[ny][nx] = max(self.dibujo[ny][nx], 0.2)
+            
+            if x == x2 and y == y2:
+                break
+            
+            e2 = 2 * err
+            if e2 > -dy:
+                err -= dy
+                x += sx
+            if e2 < dx:
+                err += dx
+                y += sy
+    
+    def limpiar(self):
+        self.dibujo = np.zeros((self.celdas, self.celdas))
+        self.ultima_pos = None
+    
+    def obtener_matriz(self):
+        return self.dibujo.copy()
+
+# ====================
+# IA CON VISUALIZACIÓN EN TIEMPO REAL (TU CÓDIGO ORIGINAL)
+# ====================
+class IAVisual:
+    def __init__(self):
+        self.datos_entrenamiento = []
+        self.letras_aprendidas = set()
+        self.modelo = None
+        self.historial_perdida = []
+        self.historial_pesos = []
+        self.activaciones_historial = []
+        self.patrones_aprendidos = []
+        self.epoca_actual = 0
+        self.training_in_progress = False
+        self.training_step = 0
+        self.entrenamiento_completo = False
+        self.cargar_datos_seguros()  # CAMBIO: método seguro
+        
+        # Para visualización en tiempo real
+        self.activaciones_actuales = None
+        self.pesos_actuales = {'W1': None, 'W2': None}
+        self.perdida_actual = 0
+        self.epoca_animacion = 0
+        self.animacion_paso = 0
+        
+        # Para curva de aprendizaje en tiempo real
+        self.curva_epocas = []
+        self.curva_perdidas = []
+        self.mejor_precision = 0
+    
+    # ===== MÉTODOS NUEVOS DE SEGURIDAD =====
+    def sanitizar_letra(self, letra):
+        return sanitizar_letra(letra)
+    
+    def guardar_datos_seguros(self):
+        """Guarda usando JSON en lugar de pickle"""
+        try:
+            # Limitar tamaño
+            if len(self.datos_entrenamiento) > 200:
+                self.datos_entrenamiento = self.datos_entrenamiento[-200:]
+            
+            datos_serializables = []
+            for matriz, letra in self.datos_entrenamiento:
+                letra_segura = self.sanitizar_letra(letra)
+                if letra_segura:
+                    # Convertir numpy array a lista para JSON
+                    datos_serializables.append({
+                        'matriz': matriz.tolist(),
+                        'letra': letra_segura
+                    })
+            
+            with open(ARCHIVO_DATOS, 'w', encoding='utf-8') as f:
+                json.dump(datos_serializables, f, indent=2)
+            
+            # Backup
+            backup = os.path.join(CARPETA_SEGURA, "backup.json")
+            with open(backup, 'w', encoding='utf-8') as f:
+                json.dump(datos_serializables, f, indent=2)
+                
+        except Exception as e:
+            print(f"Error guardando datos: {e}")
+    
+    def cargar_datos_seguros(self):
+        """Carga datos de JSON de forma segura"""
+        self.datos_entrenamiento = []
+        self.letras_aprendidas = set()
+        
+        try:
+            if not os.path.exists(ARCHIVO_DATOS):
+                return
+            
+            with open(ARCHIVO_DATOS, 'r', encoding='utf-8') as f:
+                datos_cargados = json.load(f)
+            
+            if not isinstance(datos_cargados, list):
+                return
+            
+            for item in datos_cargados:
+                try:
+                    letra = item.get('letra', '')
+                    letra_segura = self.sanitizar_letra(letra)
+                    if not letra_segura:
+                        continue
+                    
+                    matriz_lista = item.get('matriz')
+                    if not matriz_lista:
+                        continue
+                    
+                    matriz = np.array(matriz_lista, dtype=float)
+                    if matriz.shape == (8, 8):
+                        self.datos_entrenamiento.append((matriz, letra_segura))
+                        self.letras_aprendidas.add(letra_segura)
+                        
+                except Exception:
+                    continue
+                    
+        except Exception as e:
+            print(f"Error cargando datos: {e}")
+            self.datos_entrenamiento = []
+    
+    # ===== MÉTODOS ORIGINALES (sin cambios) =====
+    def reducir_matriz(self, matriz):
+        """Reduce matriz 16x16 a 8x8"""
+        if np.sum(matriz) == 0:
+            return np.zeros((8, 8))
+        
+        try:
+            filas_con = np.any(matriz > 0, axis=1)
+            cols_con = np.any(matriz > 0, axis=0)
+            
+            if not np.any(filas_con) or not np.any(cols_con):
+                return np.zeros((8, 8))
+            
+            min_fila = np.argmax(filas_con)
+            max_fila = len(filas_con) - np.argmax(filas_con[::-1]) - 1
+            min_col = np.argmax(cols_con)
+            max_col = len(cols_con) - np.argmax(cols_con[::-1]) - 1
+            
+            h_region = max_fila - min_fila + 1
+            w_region = max_col - min_col + 1
+            margen = 1
+            
+            min_fila = max(0, min_fila - margen)
+            max_fila = min(matriz.shape[0] - 1, max_fila + margen)
+            min_col = max(0, min_col - margen)
+            max_col = min(matriz.shape[1] - 1, max_col + margen)
+            
+            region = matriz[min_fila:max_fila+1, min_col:max_col+1]
+            
+            if region.shape[0] > 0 and region.shape[1] > 0:
+                zoom_y = 8 / region.shape[0]
+                zoom_x = 8 / region.shape[1]
+                reducida = zoom(region, (zoom_y, zoom_x), order=1)
+                
+                if reducida.shape != (8, 8):
+                    temp = np.zeros((8, 8))
+                    h, w = min(8, reducida.shape[0]), min(8, reducida.shape[1])
+                    temp[:h, :w] = reducida[:h, :w]
+                    reducida = temp
+                
+                return reducida
+        except:
+            pass
+        
+        return np.zeros((8, 8))
+    
+    def agregar_ejemplo(self, matriz, letra):
+        """Agrega ejemplo y actualiza visualizaciones"""
+        # Validar letra
+        letra_segura = self.sanitizar_letra(letra)
+        if not letra_segura:
+            return f"❌ Carácter no permitido: {letra}"
+        
+        matriz_reducida = self.reducir_matriz(matriz)
+        self.datos_entrenamiento.append((matriz_reducida, letra_segura))
+        self.letras_aprendidas.add(letra_segura)
+        
+        # Guardar patrón para visualización
+        self.patrones_aprendidos.append((matriz_reducida.copy(), letra_segura))
+        
+        # Guardar datos de forma segura
+        self.guardar_datos_seguros()
+        
+        return f"✓ Aprendí patrón de '{letra_segura}'"
+    
+    def iniciar_entrenamiento_visual(self):
+        """Inicia entrenamiento para visualización en tiempo real"""
+        if len(self.datos_entrenamiento) < 2:
+            return False, "Necesito más ejemplos"
+        
+        self.training_in_progress = True
+        self.training_step = 0
+        self.epoca_actual = 0
+        self.entrenamiento_completo = False
+        
+        # Preparar datos
+        X, y, letras_unicas = self._preparar_datos()
+        
+        # Inicializar red neuronal
+        n_entradas = X.shape[1]  # 64 (8x8)
+        n_ocultas = 12  # Reducido para mejor visualización
+        n_salidas = len(letras_unicas)
+        
+        np.random.seed(42)
+        W1 = np.random.randn(n_entradas, n_ocultas) * 0.1
+        b1 = np.zeros((1, n_ocultas))
+        W2 = np.random.randn(n_ocultas, n_salidas) * 0.1
+        b2 = np.zeros((1, n_salidas))
+        
+        # Guardar estado inicial
+        self.modelo = {
+            'W1': W1, 'b1': b1,
+            'W2': W2, 'b2': b2,
+            'letras': letras_unicas
+        }
+        
+        # Limpiar historiales
+        self.curva_epocas = []
+        self.curva_perdidas = []
+        self.historial_pesos = []
+        self.historial_perdida = []
+        
+        return True, f"Entrenamiento iniciado con {len(X)} ejemplos"
+    
+    def paso_entrenamiento_visual(self):
+        """Da un paso de entrenamiento para animación"""
+        if not self.training_in_progress or self.entrenamiento_completo:
+            return False
+        
+        X, y, _ = self._preparar_datos()
+        letras_unicas = self.modelo['letras']
+        
+        # Forward
+        z1 = np.dot(X, self.modelo['W1']) + self.modelo['b1']
+        a1 = np.tanh(z1)
+        z2 = np.dot(a1, self.modelo['W2']) + self.modelo['b2']
+        a2 = 1 / (1 + np.exp(-z2))
+        
+        error = a2 - self._one_hot(y, len(letras_unicas))
+        perdida = np.mean(error ** 2)
+        
+        # Backward
+        tasa = 0.08
+        
+        dW2 = np.dot(a1.T, error) / len(X)
+        db2 = np.sum(error, axis=0, keepdims=True) / len(X)
+        
+        error_oculta = np.dot(error, self.modelo['W2'].T) * (1 - a1 ** 2)
+        dW1 = np.dot(X.T, error_oculta) / len(X)
+        db1 = np.sum(error_oculta, axis=0, keepdims=True) / len(X)
+        
+        # Actualizar pesos
+        self.modelo['W2'] -= tasa * dW2
+        self.modelo['b2'] -= tasa * db2
+        self.modelo['W1'] -= tasa * dW1
+        self.modelo['b1'] -= tasa * db1
+        
+        # Guardar para curva de aprendizaje
+        if self.epoca_actual % 2 == 0:  # Cada 2 épocas
+            self.curva_epocas.append(self.epoca_actual)
+            self.curva_perdidas.append(perdida)
+            
+            # Guardar pesos para visualización
+            self.historial_pesos.append({
+                'W1': self.modelo['W1'].copy(),
+                'W2': self.modelo['W2'].copy()
+            })
+            self.historial_perdida.append(perdida)
+        
+        # Actualizar contadores
+        self.epoca_actual += 1
+        self.training_step += 1
+        self.perdida_actual = perdida
+        
+        # Verificar si terminó
+        if self.epoca_actual >= 200:  # 200 épocas
+            self.training_in_progress = False
+            self.entrenamiento_completo = True
+            
+            # Calcular precisión final
+            precision = self._calcular_precision(X, y)
+            self.mejor_precision = precision
+            
+            return True, f"✓ Entrenamiento completado ({precision*100:.0f}% precisión)"
+        
+        return True, f"Época {self.epoca_actual}/200 - Pérdida: {perdida:.4f}"
+    
+    def _preparar_datos(self):
+        """Prepara datos para entrenamiento"""
+        X = []
+        y = []
+        letras_unicas = sorted(list(self.letras_aprendidas))
+        letra_a_numero = {letra: i for i, letra in enumerate(letras_unicas)}
+        
+        for matriz, letra in self.datos_entrenamiento:
+            X.append(matriz.flatten())
+            y.append(letra_a_numero[letra])
+        
+        return np.array(X), np.array(y), letras_unicas
+    
+    def _one_hot(self, y, num_clases):
+        """Convierte a one-hot encoding"""
+        y_onehot = np.zeros((len(y), num_clases))
+        for i, val in enumerate(y):
+            y_onehot[i, val] = 1
+        return y_onehot
+    
+    def _calcular_precision(self, X, y):
+        """Calcula precisión"""
+        if self.modelo is None:
+            return 0
+        
+        correctas = 0
+        for i in range(len(X)):
+            pred, _ = self.predecir_desde_vector(X[i])
+            if pred == self.modelo['letras'][y[i]]:
+                correctas += 1
+        
+        return correctas / len(X)
+    
+    def predecir_desde_vector(self, vector):
+        """Predice desde vector"""
+        if self.modelo is None:
+            return "?", np.zeros(1)
+        
+        X = vector.reshape(1, -1)
+        
+        # Forward pass
+        z1 = np.dot(X, self.modelo['W1']) + self.modelo['b1']
+        a1 = np.tanh(z1)
+        z2 = np.dot(a1, self.modelo['W2']) + self.modelo['b2']
+        a2 = 1 / (1 + np.exp(-z2))
+        
+        # Guardar activaciones para visualización
+        self.activaciones_actuales = a1[0]
+        self.pesos_actuales = {'W1': self.modelo['W1'], 'W2': self.modelo['W2']}
+        
+        probabilidades = a2[0]
+        mejor_idx = np.argmax(probabilidades)
+        letra = self.modelo['letras'][mejor_idx]
+        
+        return letra, probabilidades
+    
+    def predecir_con_explicacion(self, matriz):
+        """Predice con explicación visual"""
+        if self.modelo is None:
+            return "?", [], "Primero entrena la IA"
+        
+        if np.sum(matriz) < 2:
+            return "?", [], "Dibuja algo en la pizarra"
+        
+        matriz_reducida = self.reducir_matriz(matriz)
+        letra, probabilidades = self.predecir_desde_vector(matriz_reducida.flatten())
+        
+        # Encontrar top 3 predicciones
+        top3_idx = np.argsort(probabilidades)[-3:][::-1]
+        letras_top3 = [self.modelo['letras'][i] for i in top3_idx]
+        confianzas_top3 = [probabilidades[i] for i in top3_idx]
+        
+        confianza = confianzas_top3[0]
+        if confianza > 0.8:
+            certeza = "MUY SEGURO"
+        elif confianza > 0.6:
+            certeza = "SEGURO"
+        else:
+            certeza = "INSEGURO"
+        
+        explicacion = f"'{letra}' ({confianza*100:.0f}% - {certeza})"
+        
+        if len(letras_top3) > 1 and confianzas_top3[1] > 0.1:
+            explicacion += f" | Alt: '{letras_top3[1]}' ({confianzas_top3[1]*100:.0f}%)"
+        
+        return letra, probabilidades, explicacion
+    
+    def obtener_patrones_aprendidos(self):
+        """Devuelve los patrones guardados"""
+        return self.patrones_aprendidos
+
+# ====================
+# VISUALIZADOR DE RED NEURONAL EN TIEMPO REAL (TU CÓDIGO)
+# ====================
+class VisualizadorRedCompleta:
+    def __init__(self, x, y, ancho, alto):
+        self.rect = pygame.Rect(x, y, ancho, alto)
+        self.tiempo = 0
+        self.pulso = 0
+        self.animacion_conexiones = 0
+        
+    def dibujar(self, pantalla, ia):
+        """Dibuja la red neuronal completa con animaciones"""
+        self.tiempo += 0.05
+        self.pulso = (math.sin(self.tiempo * 2) + 1) / 2
+        self.animacion_conexiones = (self.animacion_conexiones + 0.02) % 1
+        
+        # Fondo del visualizador
+        pygame.draw.rect(pantalla, (15, 15, 25), self.rect)
+        pygame.draw.rect(pantalla, (60, 60, 90), self.rect, 3)
+        
+        # Título
+        titulo = fuente_grande.render("RED NEURONAL EN TIEMPO REAL", True, (180, 220, 180))
+        pantalla.blit(titulo, (self.rect.x + self.rect.width//2 - titulo.get_width()//2, 
+                             self.rect.y + 10))
+        
+        if ia.modelo is None:
+            texto = fuente.render("La red se creará al entrenar", True, (150, 150, 180))
+            pantalla.blit(texto, (self.rect.x + self.rect.width//2 - texto.get_width()//2, 
+                                self.rect.y + self.rect.height//2))
+            return
+        
+        # Dimensiones de la red
+        n_entradas = ia.modelo['W1'].shape[0]  # 64
+        n_ocultas = ia.modelo['W1'].shape[1]    # 12
+        n_salidas = len(ia.modelo['letras'])    # Número de letras aprendidas
+        
+        # Espaciado para las capas
+        capa_entrada_x = self.rect.x + 80
+        capa_oculta_x = self.rect.x + self.rect.width // 2
+        capa_salida_x = self.rect.x + self.rect.width - 80
+        
+        alto_disponible = self.rect.height - 60
+        espaciado_entrada = alto_disponible / (n_entradas + 1)
+        espaciado_oculto = alto_disponible / (n_ocultas + 1)
+        espaciado_salida = alto_disponible / (n_salidas + 1)
+        
+        # ========== DIBUJAR CONEXIONES ANIMADAS ==========
+        if ia.pesos_actuales['W1'] is not None:
+            # Conexiones entrada->oculta
+            for i in range(min(20, n_entradas)):  # Solo mostrar 20 conexiones
+                for j in range(min(12, n_ocultas)):  # Solo 12 neuronas ocultas
+                    peso = ia.pesos_actuales['W1'][i, j]
+                    if abs(peso) > 0.05:  # Solo mostrar conexiones significativas
+                        # Animación de pulso
+                        fase = (self.animacion_conexiones + i * 0.03 + j * 0.05) % 1
+                        intensidad = 0.3 + 0.7 * abs(math.sin(fase * math.pi * 2))
+                        
+                        inicio_y = self.rect.y + 40 + (i + 1) * espaciado_entrada
+                        fin_y = self.rect.y + 40 + (j + 1) * espaciado_oculto
+                        
+                        # Color basado en peso y animación
+                        if peso > 0:
+                            color = (0, int(150 + 100 * intensidad), 80)
+                        else:
+                            color = (int(200 + 55 * intensidad), 80, 80)
+                        
+                        # Grosor basado en magnitud
+                        grosor = max(1, int(abs(peso) * 3 * intensidad))
+                        
+                        pygame.draw.line(pantalla, color,
+                                       (capa_entrada_x, inicio_y),
+                                       (capa_oculta_x, fin_y), grosor)
+        
+        # ========== DIBUJAR NEURONAS DE ENTRADA ==========
+        for i in range(min(20, n_entradas)):  # Solo mostrar 20
+            neurona_y = self.rect.y + 40 + (i + 1) * espaciado_entrada
+            
+            # Neurona con efecto de entrada
+            if ia.activaciones_actuales is not None and i < n_entradas:
+                # Calcular activación basada en patrones aprendidos
+                activacion = 0
+                if i < 64:  # Solo para las 64 entradas
+                    fila = i // 8
+                    col = i % 8
+                    activacion = 0.3 + 0.7 * self.pulso * (i % 3) / 3
+            
+            color = (100, 150, 200) if i % 2 == 0 else (120, 170, 220)
+            radio = 8
+            
+            pygame.draw.circle(pantalla, color, (capa_entrada_x, neurona_y), radio)
+            pygame.draw.circle(pantalla, (255, 255, 255), (capa_entrada_x, neurona_y), radio, 2)
+            
+            # Etiqueta numérica para algunas neuronas
+            if i in [0, 7, 15, 23, 31, 39, 47, 55, 63]:
+                num_text = fuente_pequena.render(str(i+1), True, (200, 200, 200))
+                pantalla.blit(num_text, (capa_entrada_x - 10, neurona_y - 25))
+        
+        # ========== DIBUJAR NEURONAS OCULTAS ==========
+        for i in range(n_ocultas):
+            neurona_y = self.rect.y + 40 + (i + 1) * espaciado_oculto
+            
+            # Calcular activación
+            if ia.activaciones_actuales is not None and i < len(ia.activaciones_actuales):
+                activacion = abs(ia.activaciones_actuales[i])
+                intensidad = int(100 + activacion * 155)
+                
+                # Color basado en activación (rojo-negativo, verde-positivo)
+                if ia.activaciones_actuales[i] > 0:
+                    color = (80, intensidad, 80)
+                else:
+                    color = (intensidad, 80, 80)
+                
+                radio = int(8 + activacion * 10)
+            else:
+                color = (150, 100, 100)
+                radio = 8
+                activacion = 0
+            
+            # Efecto de pulso para neuronas activas
+            if activacion > 0.3:
+                pulso_extra = 2 * self.pulso
+                radio_pulso = int(radio + pulso_extra)
+                pygame.draw.circle(pantalla, (color[0]//2, color[1]//2, color[2]//2), 
+                                 (capa_oculta_x, neurona_y), radio_pulso)
+            
+            # Dibujar neurona
+            pygame.draw.circle(pantalla, color, (capa_oculta_x, neurona_y), radio)
+            pygame.draw.circle(pantalla, (255, 255, 255), (capa_oculta_x, neurona_y), radio, 2)
+            
+            # Punto central
+            pygame.draw.circle(pantalla, (255, 255, 200), 
+                             (capa_oculta_x, neurona_y), max(2, radio//3))
+            
+            # Etiqueta de neurona
+            neurona_text = fuente_pequena.render(f"N{i+1}", True, COLOR_TEXTO)
+            pantalla.blit(neurona_text, (capa_oculta_x - 10, neurona_y - 25))
+            
+            # Valor de activación
+            if activacion > 0.1:
+                activ_text = fuente_pequena.render(f"{activacion:.2f}", True, (255, 255, 200))
+                pantalla.blit(activ_text, (capa_oculta_x - 15, neurona_y + 15))
+        
+        # ========== DIBUJAR NEURONAS DE SALIDA ==========
+        for i in range(min(10, n_salidas)):  # Solo mostrar 10
+            neurona_y = self.rect.y + 40 + (i + 1) * espaciado_salida
+            letra = ia.modelo['letras'][i] if i < len(ia.modelo['letras']) else "?"
+            
+            # Calcular activación de salida
+            if ia.activaciones_actuales is not None and ia.pesos_actuales['W2'] is not None:
+                # Simular activación de salida basada en conexiones
+                activacion_salida = 0
+                for j in range(min(5, n_ocultas)):
+                    if ia.activaciones_actuales[j] > 0.1:
+                        activacion_salida += ia.activaciones_actuales[j] * abs(ia.pesos_actuales['W2'][j, i])
+                
+                activacion_salida = min(1.0, activacion_salida)
+                color_intensidad = int(100 + activacion_salida * 155)
+            else:
+                activacion_salida = 0
+                color_intensidad = 100
+            
+            # Color diferente por tipo de símbolo
+            if letra.isdigit():
+                color = (color_intensidad, 100, 100)  # Rojo para números
+            elif letra.isupper():
+                color = (100, color_intensidad, 100)  # Verde para mayúsculas
+            else:
+                color = (100, 100, color_intensidad)  # Azul para minúsculas
+            
+            # Dibujar neurona de salida
+            radio = 12 + int(activacion_salida * 8)
+            pygame.draw.circle(pantalla, color, (capa_salida_x, neurona_y), radio)
+            pygame.draw.circle(pantalla, (255, 255, 255), (capa_salida_x, neurona_y), radio, 3)
+            
+            # Letra dentro de la neurona
+            letra_text = fuente.render(letra, True, COLOR_TEXTO)
+            letra_rect = letra_text.get_rect(center=(capa_salida_x, neurona_y))
+            pantalla.blit(letra_text, letra_rect)
+            
+            # Indicador de confianza si está prediciendo
+            if activacion_salida > 0:
+                conf_text = fuente_pequena.render(f"{activacion_salida*100:.0f}%", True, (200, 200, 100))
+                pantalla.blit(conf_text, (capa_salida_x + 20, neurona_y - 8))
+        
+        # ========== ETIQUETAS DE CAPAS ==========
+        entrada_text = fuente_grande.render("ENTRADA", True, (180, 200, 220))
+        oculta_text = fuente_grande.render("OCULTA", True, (180, 200, 220))
+        salida_text = fuente_grande.render("SALIDA", True, (180, 200, 220))
+        
+        pantalla.blit(entrada_text, (capa_entrada_x - 40, self.rect.y + 10))
+        pantalla.blit(oculta_text, (capa_oculta_x - 30, self.rect.y + 10))
+        pantalla.blit(salida_text, (capa_salida_x - 35, self.rect.y + 10))
+        
+        # ========== INFORMACIÓN DE ENTRENAMIENTO ==========
+        info_y = self.rect.y + self.rect.height - 40
+        
+        if ia.training_in_progress:
+            estado = f"ENTRENANDO... Época {ia.epoca_actual}/200"
+            color_estado = (255, 200, 100)
+        elif ia.entrenamiento_completo:
+            estado = f"ENTRENADA ({ia.mejor_precision*100:.0f}% precisión)"
+            color_estado = (100, 255, 100)
+        else:
+            estado = "LISTA PARA ENTRENAR"
+            color_estado = (150, 150, 150)
+        
+        estado_text = fuente.render(estado, True, color_estado)
+        pantalla.blit(estado_text, (self.rect.x + 20, info_y))
+        
+        if ia.perdida_actual > 0:
+            perdida_text = fuente.render(f"Pérdida: {ia.perdida_actual:.4f}", True, (200, 150, 150))
+            pantalla.blit(perdida_text, (self.rect.x + self.rect.width - 120, info_y))
+
+# ====================
+# VISUALIZADOR DE CURVA DE APRENDIZAJE (TU CÓDIGO)
+# ====================
+class VisualizadorCurva:
+    def __init__(self, x, y, ancho, alto):
+        self.rect = pygame.Rect(x, y, ancho, alto)
+        self.puntos_curva = []
+        
+    def dibujar(self, pantalla, ia):
+        """Dibuja la curva de aprendizaje"""
+        pygame.draw.rect(pantalla, (20, 20, 35), self.rect)
+        pygame.draw.rect(pantalla, (60, 60, 90), self.rect, 2)
+        
+        # Título
+        titulo = fuente_grande.render("CURVA DE APRENDIZAJE", True, (180, 220, 180))
+        pantalla.blit(titulo, (self.rect.x + self.rect.width//2 - titulo.get_width()//2, 
+                             self.rect.y + 10))
+        
+        if len(ia.curva_perdidas) < 2:
+            texto = fuente.render("La curva aparecerá durante el entrenamiento", True, (150, 150, 180))
+            pantalla.blit(texto, (self.rect.x + self.rect.width//2 - texto.get_width()//2, 
+                                self.rect.y + self.rect.height//2))
+            return
+        
+        # Área de gráfico
+        margen_x = 50
+        margen_y = 50
+        ancho_grafico = self.rect.width - 2 * margen_x
+        alto_grafico = self.rect.height - 2 * margen_y
+        
+        # Ejes
+        pygame.draw.line(pantalla, (100, 100, 130),
+                        (self.rect.x + margen_x, self.rect.y + margen_y + alto_grafico),
+                        (self.rect.x + margen_x + ancho_grafico, self.rect.y + margen_y + alto_grafico), 3)
+        pygame.draw.line(pantalla, (100, 100, 130),
+                        (self.rect.x + margen_x, self.rect.y + margen_y),
+                        (self.rect.x + margen_x, self.rect.y + margen_y + alto_grafico), 3)
+        
+        # Etiquetas de ejes
+        eje_x = fuente_pequena.render("Épocas", True, (150, 150, 170))
+        eje_y = fuente_pequena.render("Pérdida", True, (150, 150, 170))
+        
+        pantalla.blit(eje_x, (self.rect.x + margen_x + ancho_grafico//2 - 20, 
+                            self.rect.y + margen_y + alto_grafico + 20))
+        pantalla.blit(eje_y, (self.rect.x + margen_x - 40, 
+                            self.rect.y + margen_y + alto_grafico//2 - 10))
+        
+        # Valores en eje Y
+        max_perdida = max(ia.curva_perdidas) if ia.curva_perdidas else 1
+        for i in range(5):
+            valor = max_perdida * (5 - i) / 5
+            y_pos = self.rect.y + margen_y + (i * alto_grafico / 5)
+            valor_text = fuente_pequena.render(f"{valor:.3f}", True, (150, 150, 170))
+            pantalla.blit(valor_text, (self.rect.x + margen_x - 45, y_pos - 8))
+            
+            # Línea horizontal de guía
+            pygame.draw.line(pantalla, (40, 40, 60),
+                           (self.rect.x + margen_x, y_pos),
+                           (self.rect.x + margen_x + ancho_grafico, y_pos), 1)
+        
+        # Dibujar curva
+        puntos = []
+        for i, perdida in enumerate(ia.curva_perdidas):
+            x = self.rect.x + margen_x + (i / (len(ia.curva_perdidas) - 1)) * ancho_grafico
+            y = self.rect.y + margen_y + (perdida / max_perdida) * alto_grafico
+            puntos.append((x, y))
+        
+        if len(puntos) > 1:
+            # Línea principal
+            pygame.draw.lines(pantalla, (0, 220, 120), False, puntos, 3)
+            
+            # Puntos en la curva
+            for punto in puntos[::max(1, len(puntos)//10)]:  # Cada 10% de los puntos
+                pygame.draw.circle(pantalla, (255, 255, 200), punto, 5)
+                pygame.draw.circle(pantalla, (0, 180, 100), punto, 5, 2)
+        
+        # Anotación del mejor valor
+        if ia.curva_perdidas:
+            mejor_perdida = min(ia.curva_perdidas)
+            mejor_idx = ia.curva_perdidas.index(mejor_perdida)
+            
+            if mejor_idx < len(puntos):
+                mejor_punto = puntos[mejor_idx]
+                pygame.draw.circle(pantalla, (255, 255, 0), mejor_punto, 8)
+                pygame.draw.circle(pantalla, (200, 200, 0), mejor_punto, 8, 2)
+                
+                # Etiqueta del mejor punto
+                mejor_text = fuente_pequena.render(f"Mín: {mejor_perdida:.4f}", True, (255, 255, 0))
+                pantalla.blit(mejor_text, (mejor_punto[0] + 10, mejor_punto[1] - 20))
+        
+        # Estadísticas
+        if ia.curva_perdidas:
+            inicio_perdida = ia.curva_perdidas[0]
+            final_perdida = ia.curva_perdidas[-1]
+            mejora = ((inicio_perdida - final_perdida) / inicio_perdida) * 100
+            
+            stats_y = self.rect.y + 40
+            stats = [
+                f"Pérdida inicial: {inicio_perdida:.4f}",
+                f"Pérdida final: {final_perdida:.4f}",
+                f"Mejora: {mejora:.1f}%"
+            ]
+            
+            for i, stat in enumerate(stats):
+                stat_surf = fuente.render(stat, True, (200, 220, 200))
+                pantalla.blit(stat_surf, (self.rect.x + self.rect.width - 200, stats_y + i * 25))
+
+# ====================
+# BOTONES MEJORADOS (TU CÓDIGO)
+# ====================
+class Boton:
+    def __init__(self, x, y, ancho, alto, texto, color=COLOR_BOTON, icono=""):
+        self.rect = pygame.Rect(x, y, ancho, alto)
+        self.texto = texto
+        self.color = color
+        self.icono = icono
+        self.hover = False
+        
+    def dibujar(self, pantalla, activo=False):
+        color = COLOR_BOTON_ACTIVO if activo else self.color
+        
+        if self.hover:
+            color = tuple(min(255, c + 20) for c in color)
+        
+        # Sombra
+        pygame.draw.rect(pantalla, (0, 0, 0, 100), 
+                       (self.rect.x + 3, self.rect.y + 3, 
+                        self.rect.width, self.rect.height),
+                       border_radius=8)
+        
+        # Botón
+        pygame.draw.rect(pantalla, color, self.rect, border_radius=8)
+        pygame.draw.rect(pantalla, (255, 255, 255), self.rect, 2, border_radius=8)
+        
+        # Texto
+        txt = fuente.render(self.texto, True, COLOR_TEXTO)
+        txt_rect = txt.get_rect(center=self.rect.center)
+        pantalla.blit(txt, txt_rect)
+        
+        # Icono si tiene
+        if self.icono:
+            icono_text = fuente_grande.render(self.icono, True, COLOR_TEXTO)
+            icono_rect = icono_text.get_rect(center=(self.rect.x + 20, self.rect.centery))
+            pantalla.blit(icono_text, icono_rect)
+    
+    def presionado(self, pos):
+        self.hover = self.rect.collidepoint(pos)
+        return self.hover
+
+# ====================
+# INTERFAZ PRINCIPAL (TU CÓDIGO - SOLO CAMBIÉ DIMENSIONES)
+# ====================
+def main():
+    # Crear componentes - PIZARRA MÁS GRANDE
+    pizarron = Pizarron(30, 100, 500, 500, 16)  # Aumentada a 500x500
+    
+    # Visualizadores MÁS GRANDES
+    visualizador_red = VisualizadorRedCompleta(550, 100, 520, 500)  # Ajustado
+    visualizador_curva = VisualizadorCurva(30, 620, 1040, 500)  # Más grande: 500px
+    
+    ia = IAVisual()
+    
+    # Estado
+    estado = "DIBUJAR"
+    mensaje = "Dibuja una letra o número y enseñasela a la IA"
+    explicacion_ia = ""
+    dibujando = False
+    
+    # Letras posibles
+    letras_posibles = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", 
+                      "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T",
+                      "U", "V", "W", "X", "Y", "Z", "0", "1", "2", "3",
+                      "4", "5", "6", "7", "8", "9"]
+    
+    # Crear botones principales (reubicados)
+    boton_limpiar = Boton(30, 1140, 200, 60, "LIMPIAR PIZARRA", (200, 80, 80), "🧹")
+    boton_enseñar = Boton(250, 1140, 200, 60, "ENSEÑAR A LA IA", (80, 180, 80), "👨‍🏫")
+    boton_entrenar = Boton(470, 1140, 200, 60, "ENTRENAR RED", (180, 100, 200), "🧠")
+    boton_predecir = Boton(690, 1140, 200, 60, "PREDECIR", (100, 150, 220), "🔮")
+    boton_continuar = Boton(910, 1140, 200, 60, "CONTINUAR", (150, 100, 180), "⚡")
+    
+    # Botones de letras para enseñar
+    botones_letras = []
+    for i, letra in enumerate(letras_posibles):
+        fila = i // 6
+        col = i % 6
+        x = 30 + col * 50
+        y = 1220 + fila * 45
+        boton = Boton(x, y, 45, 40, letra, (60, 80, 120))
+        botones_letras.append((boton, letra))
+    
+    # Área de explicación de predicción (más grande)
+    area_explicacion = pygame.Rect(30, 1480, 1040, 200)
+    
+    # Bucle principal
+    while True:
+        mouse_pos = pygame.mouse.get_pos()
+        mouse_click = False
+        
+        # Procesar eventos
+        for evento in pygame.event.get():
+            if evento.type == pygame.QUIT:
+                ia.guardar_datos_seguros()  # Guardar antes de salir
+                pygame.quit()
+                sys.exit()
+            
+            if evento.type == pygame.MOUSEBUTTONDOWN:
+                if evento.button == 1:
+                    mouse_click = True
+                    
+                    # Botones principales
+                    if boton_limpiar.presionado(mouse_pos):
+                        pizarron.limpiar()
+                        mensaje = "Pizarra limpiada ✓"
+                    
+                    elif boton_enseñar.presionado(mouse_pos):
+                        if np.sum(pizarron.dibujo) > 4:
+                            estado = "ENSEÑAR"
+                            mensaje = "Selecciona qué letra o número es:"
+                        else:
+                            mensaje = "¡Dibuja algo primero!"
+                    
+                    elif boton_entrenar.presionado(mouse_pos):
+                        if len(ia.datos_entrenamiento) >= 2:
+                            iniciado, msg = ia.iniciar_entrenamiento_visual()
+                            mensaje = msg
+                        else:
+                            mensaje = "Necesito al menos 2 ejemplos diferentes"
+                    
+                    elif boton_predecir.presionado(mouse_pos):
+                        if np.sum(pizarron.dibujo) > 2:
+                            letra, probs, explicacion = ia.predecir_con_explicacion(pizarron.dibujo)
+                            mensaje = f"Predicción: '{letra}'"
+                            explicacion_ia = explicacion
+                        else:
+                            mensaje = "Dibuja algo primero"
+                    
+                    elif boton_continuar.presionado(mouse_pos):
+                        if ia.training_in_progress or not ia.entrenamiento_completo:
+                            terminado, msg = ia.paso_entrenamiento_visual()
+                            mensaje = msg
+                    
+                    # Botones de letras (modo enseñar)
+                    elif estado == "ENSEÑAR":
+                        for boton, letra in botones_letras:
+                            if boton.presionado(mouse_pos):
+                                resultado = ia.agregar_ejemplo(pizarron.dibujo.copy(), letra)
+                                mensaje = resultado
+                                estado = "DIBUJAR"
+                                pizarron.limpiar()
+                                break
+                    
+                    # Dibujar en pizarra
+                    elif pizarron.rect.collidepoint(mouse_pos):
+                        dibujando = True
+                        pizarron.agregar_punto(*mouse_pos)
+            
+            elif evento.type == pygame.MOUSEBUTTONUP:
+                if evento.button == 1:
+                    dibujando = False
+                    pizarron.ultima_pos = None
+            
+            elif evento.type == pygame.MOUSEMOTION:
+                # Actualizar hover en botones
+                for boton in [boton_limpiar, boton_enseñar, boton_entrenar, 
+                            boton_predecir, boton_continuar]:
+                    boton.presionado(mouse_pos)
+                
+                for boton, _ in botones_letras:
+                    boton.presionado(mouse_pos)
+                
+                # Dibujar
+                if dibujando and pizarron.rect.collidepoint(mouse_pos):
+                    pizarron.agregar_punto(*mouse_pos)
+        
+        # Avanzar entrenamiento automáticamente si está en progreso
+        if ia.training_in_progress and not ia.entrenamiento_completo:
+            terminado, msg = ia.paso_entrenamiento_visual()
+            if terminado and ia.entrenamiento_completo:
+                mensaje = msg
+        
+        # ========== DIBUJAR INTERFAZ ==========
+        pantalla.fill(COLOR_FONDO)
+        
+        # Título principal
+        titulo = fuente_grande.render("🧠 IA VISUAL - RED NEURONAL EN TIEMPO REAL 🧠", True, COLOR_LAPIZ)
+        pantalla.blit(titulo, (ANCHO//2 - titulo.get_width()//2, 20))
+        
+        subtitulo = fuente.render("Observa cómo se construye y aprende la red neuronal paso a paso", True, (180, 220, 180))
+        pantalla.blit(subtitulo, (ANCHO//2 - subtitulo.get_width()//2, 60))
+        
+        # Pizarrón (más grande)
+        pizarron.dibujar(pantalla)
+        pizarron_label = fuente.render("PIZARRA DE DIBUJO", True, COLOR_LAPIZ)
+        pantalla.blit(pizarron_label, (30, 80))
+        
+        # Visualizador de red neuronal (ajustado)
+        visualizador_red.dibujar(pantalla, ia)
+        
+        # Visualizador de curva de aprendizaje (más grande)
+        visualizador_curva.dibujar(pantalla, ia)
+        
+        # Botones principales
+        boton_limpiar.dibujar(pantalla)
+        boton_enseñar.dibujar(pantalla, estado == "ENSEÑAR")
+        boton_entrenar.dibujar(pantalla)
+        boton_predecir.dibujar(pantalla)
+        boton_continuar.dibujar(pantalla, ia.training_in_progress)
+        
+        # Panel de botones de letras (solo en modo ENSEÑAR)
+        if estado == "ENSEÑAR":
+            panel_letras = pygame.Rect(25, 1215, 1050, 200)
+            pygame.draw.rect(pantalla, (30, 30, 50), panel_letras, border_radius=10)
+            pygame.draw.rect(pantalla, (60, 80, 120), panel_letras, 2, border_radius=10)
+            
+            titulo_letras = fuente_grande.render("¿QUÉ LETRA O NÚMERO ES ESTE?", True, (220, 240, 255))
+            pantalla.blit(titulo_letras, (ANCHO//2 - titulo_letras.get_width()//2, 1225))
+            
+            for boton, letra in botones_letras:
+                boton.dibujar(pantalla)
+        
+        # Área de explicación (más grande)
+        pygame.draw.rect(pantalla, (25, 25, 40), area_explicacion, border_radius=10)
+        pygame.draw.rect(pantalla, (80, 120, 180), area_explicacion, 2, border_radius=10)
+        
+        expl_titulo = fuente_grande.render("EXPLICACIÓN DE LA PREDICCIÓN", True, (180, 200, 220))
+        pantalla.blit(expl_titulo, (area_explicacion.x + area_explicacion.width//2 - expl_titulo.get_width()//2, 
+                                   area_explicacion.y - 25))
+        
+        if explicacion_ia:
+            palabras = explicacion_ia.split()
+            lineas = []
+            linea_actual = ""
+            
+            for palabra in palabras:
+                if len(linea_actual) + len(palabra) < 70:
+                    linea_actual += palabra + " "
+                else:
+                    lineas.append(linea_actual)
+                    linea_actual = palabra + " "
+            
+            if linea_actual:
+                lineas.append(linea_actual)
+            
+            for i, linea in enumerate(lineas[:3]):
+                linea_y = area_explicacion.y + 40 + i * 45
+                linea_surf = fuente_grande.render(linea, True, (240, 240, 200))
+                pantalla.blit(linea_surf, (area_explicacion.x + 20, linea_y))
+        else:
+            texto_default = fuente_grande.render("La IA explicará su razonamiento aquí...", True, (180, 180, 220))
+            pantalla.blit(texto_default, (area_explicacion.x + area_explicacion.width//2 - texto_default.get_width()//2, 
+                                         area_explicacion.y + area_explicacion.height//2 - 20))
+        
+        # Estadísticas en la parte inferior
+        stats_y = 1700
+        stats_rect = pygame.Rect(30, stats_y, 1040, 120)
+        pygame.draw.rect(pantalla, (30, 30, 50), stats_rect, border_radius=10)
+        
+        stats_titulo = fuente_grande.render("ESTADÍSTICAS DEL SISTEMA", True, (180, 200, 220))
+        pantalla.blit(stats_titulo, (ANCHO//2 - stats_titulo.get_width()//2, stats_y - 25))
+        
+        stats = [
+            f"Ejemplos enseñados: {len(ia.datos_entrenamiento)}",
+            f"Símbolos aprendidos: {len(ia.letras_aprendidas)}",
+            f"Estado red: {'ENTRENANDO...' if ia.training_in_progress else 'ENTRENADA' if ia.entrenamiento_completo else 'SIN ENTRENAR'}",
+            f"Épocas completadas: {ia.epoca_actual}",
+            f"Precisión: {ia.mejor_precision*100:.0f}%" if ia.mejor_precision > 0 else "Precisión: N/A"
+        ]
+        
+        for i, stat in enumerate(stats):
+            stat_x = 50 + (i % 3) * 350
+            stat_y = stats_y + 30 + (i // 3) * 35
+            stat_surf = fuente.render(stat, True, (200, 220, 200))
+            pantalla.blit(stat_surf, (stat_x, stat_y))
+        
+        # Mensaje del sistema
+        pygame.draw.rect(pantalla, (40, 40, 60), 
+                        (ANCHO//2 - 300, ALTO - 60, 600, 40), 
+                        border_radius=8)
+        pygame.draw.rect(pantalla, COLOR_LAPIZ, 
+                        (ANCHO//2 - 300, ALTO - 60, 600, 40), 
+                        2, border_radius=8)
+        
+        msg_surf = fuente_grande.render(mensaje[:50], True, COLOR_LAPIZ)
+        pantalla.blit(msg_surf, (ANCHO//2 - msg_surf.get_width()//2, ALTO - 50))
+        
+        # Instrucciones finales
+        instruc_text = fuente_pequena.render(
+            "INSTRUCCIONES: 1) Dibuja  2) Enseña (selecciona letra)  3) Entrena  4) Predice  5) Observa la curva",
+            True, (150, 180, 200)
+        )
+        pantalla.blit(instruc_text, (ANCHO//2 - instruc_text.get_width()//2, ALTO - 20))
+        
+        pygame.display.flip()
+        reloj.tick(60)
+
+# ====================
+# EJECUTAR
+# ====================
+if __name__ == "__main__":
+    print("="*60)
+    print("🧠 IA VISUAL - VERSIÓN SEGURA (JSON)")
+    print(f"📁 Datos guardados en: {CARPETA_SEGURA}")
+    print("="*60)
+    main()
